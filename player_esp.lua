@@ -11,6 +11,7 @@
 
 local Players = game:GetService('Players')
 local RunService = game:GetService('RunService')
+local UserInputService = game:GetService('UserInputService')
 local Workspace = game:GetService('Workspace')
 
 local LocalPlayer = Players.LocalPlayer
@@ -68,6 +69,11 @@ RightGroupBox:AddSlider('FOVRadius', {
 
 RightGroupBox:AddToggle('ShowFOV', {
     Text = 'Show FOV',
+    Default = false,
+})
+
+RightGroupBox:AddToggle('WallCheck', {
+    Text = 'Wall Check',
     Default = false,
 })
 
@@ -315,12 +321,11 @@ function TargetingController.new()
     self.lockedByKey = false
     self.fovRadius = 140
     self.showFov = false
-    self.snapAngleTolerance = math.rad(3)
-    self.softLockBaseStrength = 0.04
-    self.softLockMaxStrength = 0.12
-    self.softLockDistanceScaleMax = 0.65
-    self.softLockCenterBias = 1.0
-    self.softLockSwitchTolerance = 0.8
+    self.wallCheck = false
+    self.softLockBaseStrength = 0.7
+    self.softLockMaxStrength = 1.0
+    self.camLockBaseStrength = 0.85
+    self.camLockMaxStrength = 1.0
     self.fovCircle = Drawing.new('Circle')
     self.fovCircle.Filled = false
     self.fovCircle.Thickness = 1
@@ -337,7 +342,7 @@ local function getHumanoid(character)
     return character and character:FindFirstChildOfClass('Humanoid')
 end
 
-local function isValidTarget(player, camera)
+local function isValidTarget(player, camera, wallCheck)
     if player == LocalPlayer then
         return false
     end
@@ -363,27 +368,52 @@ local function isValidTarget(player, camera)
     end
 
     local _, onScreen = camera:WorldToViewportPoint(root.Position)
+    if not onScreen then
+        return false
+    end
+
+    local direction = root.Position - camera.CFrame.Position
+    if camera.CFrame.LookVector:Dot(direction.Unit) <= 0 then
+        return false
+    end
+
+    if wallCheck then
+        local rayParams = RaycastParams.new()
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        local ignoreList = {}
+        if LocalPlayer.Character then
+            table.insert(ignoreList, LocalPlayer.Character)
+        end
+        rayParams.FilterDescendantsInstances = ignoreList
+        rayParams.IgnoreWater = true
+
+        local result = Workspace:Raycast(camera.CFrame.Position, direction, rayParams)
+        if result and not result.Instance:IsDescendantOf(character) then
+            return false
+        end
+    end
+
     return onScreen
 end
 
-local function getScreenDistanceToCenter(camera, root)
+local function getScreenDistance(camera, root, screenPoint)
     local point, onScreen = camera:WorldToViewportPoint(root.Position)
     if not onScreen then
         return math.huge
     end
 
-    local viewportCenter = camera.ViewportSize / 2
-    local delta = Vector2.new(point.X, point.Y) - viewportCenter
+    local delta = Vector2.new(point.X, point.Y) - screenPoint
     return delta.Magnitude
 end
 
 local function isWithinFov(camera, root, radius)
-    local distance = getScreenDistanceToCenter(camera, root)
+    local mousePos = UserInputService:GetMouseLocation()
+    local distance = getScreenDistance(camera, root, mousePos)
     return distance <= radius
 end
 
-local function findClosestToCenter(camera, radius)
-    local viewportCenter = camera.ViewportSize / 2
+local function findClosestToMouse(camera, radius, wallCheck)
+    local mousePos = UserInputService:GetMouseLocation()
     local bestPlayer
     local bestDistance = math.huge
 
@@ -392,10 +422,8 @@ local function findClosestToCenter(camera, radius)
             local root = getHumanoidRoot(player.Character)
             local humanoid = getHumanoid(player.Character)
             if root and humanoid and humanoid.Health > 0 then
-                local point, onScreen = camera:WorldToViewportPoint(root.Position)
-                if onScreen then
-                    local delta = Vector2.new(point.X, point.Y) - viewportCenter
-                    local distance = delta.Magnitude
+                if isValidTarget(player, camera, wallCheck) then
+                    local distance = getScreenDistance(camera, root, mousePos)
                     if distance <= radius and distance < bestDistance then
                         bestDistance = distance
                         bestPlayer = player
@@ -427,7 +455,7 @@ function TargetingController:toggleLock(camera)
         return
     end
 
-    local target = findClosestToCenter(camera, self.fovRadius)
+    local target = findClosestToMouse(camera, self.fovRadius, self.wallCheck)
     if not target then
         return
     end
@@ -437,14 +465,14 @@ function TargetingController:toggleLock(camera)
 end
 
 function TargetingController:updateFovVisual(camera)
-    local viewportCenter = camera.ViewportSize / 2
-    self.fovCircle.Position = Vector2.new(viewportCenter.X, viewportCenter.Y)
+    local mousePos = UserInputService:GetMouseLocation()
+    self.fovCircle.Position = Vector2.new(mousePos.X, mousePos.Y)
     self.fovCircle.Radius = self.fovRadius
     self.fovCircle.Visible = self.showFov and self.mode ~= 'None'
 end
 
 function TargetingController:applyCamLock(camera)
-    if self.target and not isValidTarget(self.target, camera) then
+    if self.target and not isValidTarget(self.target, camera, self.wallCheck) then
         self.target = nil
         self.lockedByKey = false
         Toggles.CamLock:SetValue(false)
@@ -457,19 +485,17 @@ function TargetingController:applyCamLock(camera)
         return
     end
 
-    local target = self.target or findClosestToCenter(camera, self.fovRadius)
-    if not target then
+    if not self.target then
         return
     end
 
-    self.target = target
-    local root = getHumanoidRoot(target.Character)
+    local root = getHumanoidRoot(self.target.Character)
     if not root then
         Toggles.CamLock:SetValue(false)
         return
     end
 
-    local screenPoint, onScreen = camera:WorldToViewportPoint(root.Position)
+    local onScreen = isValidTarget(self.target, camera, self.wallCheck)
     if not onScreen or not isWithinFov(camera, root, self.fovRadius) then
         self.target = nil
         self.lockedByKey = false
@@ -477,85 +503,59 @@ function TargetingController:applyCamLock(camera)
         return
     end
 
-    local desired = CFrame.new(camera.CFrame.Position, root.Position)
-    local angle = math.acos(math.clamp(camera.CFrame.LookVector:Dot(desired.LookVector), -1, 1))
-    if angle > self.snapAngleTolerance then
-        camera.CFrame = desired
+    if not self:isAiming() then
+        return
     end
+
+    local desiredLook = (root.Position - camera.CFrame.Position).Unit
+    local strength = self:getLerpStrength(camera, root, self.camLockBaseStrength, self.camLockMaxStrength)
+    local newLook = camera.CFrame.LookVector:Lerp(desiredLook, strength)
+    camera.CFrame = CFrame.new(camera.CFrame.Position, camera.CFrame.Position + newLook)
 end
 
 function TargetingController:applySoftLock(camera)
-    local bestTarget = findClosestToCenter(camera, self.fovRadius)
-    if not bestTarget then
-        if not self.lockedByKey then
-            self.target = nil
-        else
-            self.target = nil
-            self.lockedByKey = false
-        end
+    if not self.target then
         return
     end
 
-    if self.lockedByKey then
-        if not (self.target and isValidTarget(self.target, camera)) then
-            self.target = nil
-            self.lockedByKey = false
-        end
-    elseif self.target and isValidTarget(self.target, camera) then
-        local currentRoot = getHumanoidRoot(self.target.Character)
-        local bestRoot = getHumanoidRoot(bestTarget.Character)
-        if currentRoot and bestRoot then
-            local currentDistance = getScreenDistanceToCenter(camera, currentRoot)
-            local bestDistance = getScreenDistanceToCenter(camera, bestRoot)
-            if bestDistance < currentDistance * self.softLockSwitchTolerance then
-                self.target = bestTarget
-            end
-        else
-            self.target = bestTarget
-        end
-    else
-        self.target = bestTarget
-    end
-
-    local target = self.target
-    if not target then
+    if not isValidTarget(self.target, camera, self.wallCheck) then
+        self.target = nil
+        self.lockedByKey = false
         return
     end
 
-    local root = getHumanoidRoot(target.Character)
+    local root = getHumanoidRoot(self.target.Character)
     if not root then
-        if not self.lockedByKey then
-            self.target = nil
-        else
-            self.target = nil
-            self.lockedByKey = false
-        end
+        self.target = nil
+        self.lockedByKey = false
         return
     end
 
-    local screenPoint, onScreen = camera:WorldToViewportPoint(root.Position)
-    if not onScreen or not isWithinFov(camera, root, self.fovRadius) then
-        if not self.lockedByKey then
-            self.target = nil
-        else
-            self.target = nil
-            self.lockedByKey = false
-        end
+    if not isWithinFov(camera, root, self.fovRadius) then
+        self.target = nil
+        self.lockedByKey = false
         return
     end
 
-    local viewportCenter = camera.ViewportSize / 2
-    local delta = Vector2.new(screenPoint.X, screenPoint.Y) - viewportCenter
-    local screenDistance = delta.Magnitude
+    if not self:isAiming() then
+        return
+    end
 
+    local desiredLook = (root.Position - camera.CFrame.Position).Unit
+    local strength = self:getLerpStrength(camera, root, self.softLockBaseStrength, self.softLockMaxStrength)
+    local newLook = camera.CFrame.LookVector:Lerp(desiredLook, strength)
+    camera.CFrame = CFrame.new(camera.CFrame.Position, camera.CFrame.Position + newLook)
+end
+
+function TargetingController:isAiming()
+    return UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter
+        or UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+end
+
+function TargetingController:getLerpStrength(camera, root, baseStrength, maxStrength)
     local distance = (camera.CFrame.Position - root.Position).Magnitude
-    local distanceFactor = math.clamp(1 - (distance / 300), 0.1, self.softLockDistanceScaleMax)
-    local screenFactor = math.clamp(1 - (screenDistance / self.fovRadius), 0, 1) * self.softLockCenterBias
-
-    local strength = math.clamp(self.softLockBaseStrength + ((self.softLockMaxStrength - self.softLockBaseStrength) * screenFactor), self.softLockBaseStrength, self.softLockMaxStrength) * distanceFactor
-    local desired = CFrame.new(camera.CFrame.Position, root.Position)
-
-    camera.CFrame = camera.CFrame:Lerp(desired, strength)
+    local distanceFactor = math.clamp(distance / 200, 0, 1)
+    return math.clamp(baseStrength + ((maxStrength - baseStrength) * distanceFactor), baseStrength, maxStrength)
 end
 
 function TargetingController:start()
@@ -591,6 +591,7 @@ local targeting = TargetingController.new()
 targeting:start()
 targeting.fovRadius = Options.FOVRadius.Value
 targeting.showFov = Toggles.ShowFOV.Value
+targeting.wallCheck = Toggles.WallCheck.Value
 
 Toggles.PlayerESP:OnChanged(function()
     controller:setEnabled(Toggles.PlayerESP.Value)
@@ -606,6 +607,10 @@ end)
 
 Toggles.ShowFOV:OnChanged(function()
     targeting.showFov = Toggles.ShowFOV.Value
+end)
+
+Toggles.WallCheck:OnChanged(function()
+    targeting.wallCheck = Toggles.WallCheck.Value
 end)
 
 Options.LockTargetKey:OnClick(function()
